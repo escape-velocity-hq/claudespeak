@@ -1,7 +1,9 @@
 {
   "name": "claudespeak",
-  "version": "0.1.0",
-  "author": { "name": "albertshiney" },
+  "version": "0.2.0",
+  "author": {
+    "name": "albertshiney"
+  },
   "repository": "https://github.com/albertshiney/claudespeak",
   "description": "Reads a 1-3 sentence summary of each finished Claude Code reply aloud with Fish Audio, one voice at a time across sessions",
   "userConfig": {
@@ -15,7 +17,11 @@
       "type": "string",
       "title": "Fish TTS model",
       "description": "Sent as the `model` header on /v1/tts",
-      "options": ["drama-3", "s2.1-pro", "s2-pro"],
+      "options": [
+        "drama-3",
+        "s2.1-pro",
+        "s2-pro"
+      ],
       "default": "drama-3"
     },
     "summaryModel": {
@@ -23,6 +29,28 @@
       "title": "Summary model",
       "description": "Small fast model that turns a long reply into 1-3 spoken sentences",
       "default": "haiku"
+    },
+    "minSeconds": {
+      "type": "string",
+      "title": "Speak only after long turns",
+      "description": "Read a reply aloud only when the turn ran at least this many seconds. 0 reads every reply.",
+      "default": "20"
+    },
+    "dailyCharLimit": {
+      "type": "string",
+      "title": "Daily spoken-character limit",
+      "description": "Stop speaking for the day after this many characters, to cap Fish Audio credits. 0 means no limit.",
+      "default": "20000"
+    },
+    "redact": {
+      "type": "string",
+      "title": "Hide private details",
+      "description": "Replace email addresses, phone numbers and money amounts before anything is sent to Fish Audio or spoken.",
+      "options": [
+        "on",
+        "off"
+      ],
+      "default": "on"
     }
   }
 }
