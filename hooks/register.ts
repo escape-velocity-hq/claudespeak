@@ -1,5 +1,11 @@
 import type { EngineInterface, PluginOptions, Register } from 'claude-code'
 
+import {
+  dayOf, detectPlatform, parseNumber, parseSwitch, redactPrivate, shouldSpeak, stdinHeaders,
+  unixPlayer, usageText, usedToday, windowsBatch, winPath, withinBudget,
+} from './extras'
+import type { Platform } from './extras'
+
 // claudespeak: each finished reply is cut to 1-3 spoken sentences by a
 // small model and read aloud by Fish TTS, streamed so it starts on the first chunk.
 // One machine-wide switch (/speak on|off, read at every reply) and one voice at a time
@@ -25,31 +31,40 @@ const DATA_DIR = '.claude/claudespeak'
 const ENV_FILE = '.env'
 const SETTING_FILE = 'setting.json'
 const CURRENT_FILE = 'current-speech'
+const USAGE_FILE = 'usage.json'
 const TAG_PREFIX = 'claudespeak-'
 /** Any session's player and download, and nothing else: their own argv starts with the binary. */
-export const ANY_SPEECH = `^(${CURL}|[^ ]*/ffmpeg) .*${TAG_PREFIX}[0-9]+`
+export const ANY_SPEECH = `^(${CURL}|[^ ]*/ff(mpeg|play)) .*${TAG_PREFIX}[0-9]+`
 
 // One pipeline, so nothing waits for the whole clip: Fish's raw PCM goes straight into
 // the default output. $6 tags curl and ffmpeg so they can be found again.
 // One voice at a time, with no lock to go stale: claim the file, kill every other player,
 // start, and give way if a newer speaker claimed it while this one was starting.
-const STREAM_SCRIPT =
+const streamScript = (platform: Platform): string =>
   'exec 3<&0; printf %s "$6" > "$7"; "$8" -KILL -f "$9"; [ "$(cat "$7")" = "$6" ] || exit 0; ' +
   '"$1" -sSfN --max-time 60 -H @- -A "$6" -H "Content-Type: application/json" -H "model: $4" --data-binary "@$5" "$3" <&3 | ' +
-  '"$2" -nostdin -hide_banner -loglevel error -fflags nobuffer -probesize 32 -analyzeduration 0 ' +
-  `-f s16le -ar ${SAMPLE_RATE} -ac 1 -i pipe:0 -af silenceremove=start_periods=1:start_threshold=-50dB -metadata title="$6" -f audiotoolbox - & ` +
+  `${unixPlayer(platform, SAMPLE_RATE)} & ` +
   'P=$!; sleep 0.1; [ "$(cat "$7")" = "$6" ] || "$8" -KILL -f "$6"; wait $P'
 
 export type VoiceConfig = {
   voiceId: string
   ttsModel: string
   summaryModel: string
+  /** Speak only replies whose turn ran at least this many seconds. 0 speaks every reply. */
+  minSeconds: number
+  /** Stop speaking for the day after this many characters. 0 means no limit. */
+  dailyCharLimit: number
+  /** Replace email addresses, phone numbers and money amounts before anything is spoken. */
+  redact: boolean
 }
 
 export const DEFAULTS: VoiceConfig = {
   voiceId: 'fa4c9eb3dccc4806b382b40d61c6b10a', // Sawyer, a Fish Official voice
   ttsModel: 'drama-3',
   summaryModel: 'haiku',
+  minSeconds: 0,
+  dailyCharLimit: 0,
+  redact: true,
 }
 
 const SUMMARY_SYSTEM = [
@@ -70,6 +85,9 @@ const readConfig = (options: PluginOptions): VoiceConfig => {
     voiceId: text('voiceId', DEFAULTS.voiceId),
     ttsModel: text('ttsModel', DEFAULTS.ttsModel),
     summaryModel: text('summaryModel', DEFAULTS.summaryModel),
+    minSeconds: parseNumber(options['minSeconds'], DEFAULTS.minSeconds, 0, 3600),
+    dailyCharLimit: parseNumber(options['dailyCharLimit'], DEFAULTS.dailyCharLimit, 0, 10_000_000),
+    redact: parseSwitch(options['redact'], DEFAULTS.redact),
   }
 }
 
@@ -176,11 +194,15 @@ const st: {
   streamTag: string | undefined
   hasWarnedKey: boolean
   isInteractive: boolean
+  turnStartedAt: number | undefined
+  platform: Platform | undefined
 } = {
   speechGen: 0,
   streamTag: undefined,
   hasWarnedKey: false,
   isInteractive: false,
+  turnStartedAt: undefined,
+  platform: undefined,
 }
 
 let cfg: VoiceConfig = DEFAULTS
@@ -188,8 +210,33 @@ let cfg: VoiceConfig = DEFAULTS
 function stopSpeech($: $): void {
   st.speechGen += 1
   // KILL, not TERM: on TERM ffmpeg plays out everything it has already queued.
-  if (st.streamTag !== undefined) void $.process.run([PKILL, '-KILL', '-f', st.streamTag]).catch(() => undefined)
+  if (st.streamTag !== undefined) {
+    const argv = st.platform === 'windows' ? WIN_KILL : [PKILL, '-KILL', '-f', st.streamTag]
+    void $.process.run(argv).catch(() => undefined)
+  }
   st.streamTag = undefined
+}
+
+/** Windows: stops the player by image name. That is every ffplay on the machine, not only ours. */
+const WIN_KILL = ['taskkill', '/F', '/IM', 'ffplay.exe']
+
+/** Worked out once per session: Windows by its OS variable, macOS by /usr/bin/open, else Linux. */
+async function platformOf($: $): Promise<Platform> {
+  if (st.platform !== undefined) return st.platform
+  const osEnv = await $.env.get('OS')
+  const hasMacOpen = osEnv === 'Windows_NT' ? false : await $.fs.exists('/usr/bin/open').catch(() => false)
+  st.platform = detectPlatform(osEnv, hasMacOpen)
+  return st.platform
+}
+
+async function makeDataDir($: $): Promise<void> {
+  const dir = await homeData($)
+  if ((await platformOf($)) === 'windows') {
+    // mkdir fails when the folder is already there, which is fine.
+    await $.process.run(['cmd.exe', '/d', '/c', 'mkdir', winPath(dir)]).catch(() => undefined)
+    return
+  }
+  await $.process.run(['/bin/mkdir', '-p', '-m', '700', dir])
 }
 
 async function dataPath($: $, file: string): Promise<string> {
@@ -197,7 +244,7 @@ async function dataPath($: $, file: string): Promise<string> {
 }
 
 async function writeData($: $, file: string, text: string): Promise<void> {
-  await $.process.run(['/bin/mkdir', '-p', '-m', '700', await homeData($)])
+  await makeDataDir($)
   await $.fs.write(await dataPath($, file), text)
 }
 
@@ -210,21 +257,30 @@ async function isSettingOn($: $): Promise<boolean> {
 /** Cuts speech in every session, and tells a reply still being summarised to stay quiet. */
 async function stopEverySpeech($: $): Promise<void> {
   stopSpeech($)
-  await $.process.run([PKILL, '-KILL', '-f', ANY_SPEECH]).catch(() => undefined)
+  const killAll = (await platformOf($)) === 'windows' ? WIN_KILL : [PKILL, '-KILL', '-f', ANY_SPEECH]
+  await $.process.run(killAll).catch(() => undefined)
   await writeData($, CURRENT_FILE, `stopped ${await $.clock.now()}`)
 }
 
 async function tmpDir($: $): Promise<string> {
+  if ((await platformOf($)) === 'windows') {
+    return winPath((await $.env.get('TEMP')) ?? (await $.env.get('TMP')) ?? 'C:/Windows/Temp').replace(/\\+$/, '')
+  }
   const dir = (await $.env.get('TMPDIR')) ?? '/tmp'
   return dir.replace(/\/+$/, '') || '/tmp'
 }
 
 async function rm($: $, ...paths: string[]): Promise<void> {
+  if ((await platformOf($)) === 'windows') {
+    for (const path of paths) await $.process.run(['cmd.exe', '/d', '/c', 'del', '/q', winPath(path)]).catch(() => undefined)
+    return
+  }
   await $.process.run(['/bin/rm', '-f', ...paths]).catch(() => undefined)
 }
 
 async function homeData($: $): Promise<string> {
-  return `${(await $.env.get('HOME')) ?? ''}/${DATA_DIR}`
+  const home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE')) ?? ''
+  return `${home}/${DATA_DIR}`
 }
 
 /** The environment first, then the one .env. Read fresh, so a pasted key works at once. */
@@ -239,17 +295,23 @@ async function apiKey($: $): Promise<string | undefined> {
 async function ensureEnvFile($: $): Promise<boolean> {
   const path = await dataPath($, ENV_FILE)
   if (await $.fs.exists(path).catch(() => false)) return false
-  await $.process.run(['/bin/mkdir', '-p', '-m', '700', await homeData($)])
-  await $.process.run(['/bin/sh', '-c', 'umask 077; : > "$1"', 'claudespeak', path])
+  await makeDataDir($)
+  const isWindows = (await platformOf($)) === 'windows'
+  // Windows keeps the file private through the user profile folder's own permissions.
+  if (!isWindows) await $.process.run(['/bin/sh', '-c', 'umask 077; : > "$1"', 'claudespeak', path])
   const template = await $.fs.read(`${$.plugin.root}/.env.example`).catch(() => ENV_TEMPLATE)
   await $.fs.write(path, template)
-  await $.process.run(['/bin/chmod', '600', path])
+  if (!isWindows) await $.process.run(['/bin/chmod', '600', path])
   return true
 }
 
 /** Opens the .env in the default text editor where the platform has a way to. */
 async function openEnvFile($: $): Promise<boolean> {
   const path = await dataPath($, ENV_FILE)
+  if ((await platformOf($)) === 'windows') {
+    const shown = await $.process.run(['cmd.exe', '/d', '/c', 'start', 'notepad.exe', winPath(path)]).catch(() => undefined)
+    return shown?.exitCode === 0
+  }
   const opened = (await $.fs.exists('/usr/bin/open').catch(() => false))
     ? await $.process.run(['/usr/bin/open', '-t', path]).catch(() => undefined)
     : await $.process.run(['/usr/bin/env', 'xdg-open', path]).catch(() => undefined)
@@ -271,14 +333,30 @@ async function askForKey($: $): Promise<void> {
     .catch(() => undefined)
 }
 
-async function findFfmpeg($: $): Promise<string | undefined> {
-  for (const path of FFMPEG_PATHS) {
-    if (await $.fs.exists(path).catch(() => false)) return path
+/** The player: ffmpeg on macOS (as upstream), ffplay on Linux and Windows. */
+async function findPlayer($: $): Promise<string | undefined> {
+  const platform = await platformOf($)
+  if (platform === 'windows') {
+    const where = await $.process.run(['where', 'ffplay']).catch(() => undefined)
+    const first = where?.exitCode === 0 ? (where.stdout.split(/\r?\n/)[0] ?? '').trim() : ''
+    return first === '' ? undefined : first
   }
-  const which = await $.process.run(['/usr/bin/which', 'ffmpeg']).catch(() => undefined)
+  const name = platform === 'mac' ? 'ffmpeg' : 'ffplay'
+  for (const path of FFMPEG_PATHS) {
+    const candidate = path.replace(/ffmpeg$/, name)
+    if (await $.fs.exists(candidate).catch(() => false)) return candidate
+  }
+  const which = await $.process.run(['/usr/bin/which', name]).catch(() => undefined)
   const found = which?.exitCode === 0 ? which.stdout.trim() : ''
   return found === '' ? undefined : found
 }
+
+const playerHelp = (platform: Platform): string =>
+  platform === 'mac'
+    ? 'ffmpeg not found: brew install ffmpeg'
+    : platform === 'windows'
+      ? 'ffplay not found: install ffmpeg (winget install Gyan.FFmpeg) and restart Claude Code'
+      : 'ffplay not found: install ffmpeg (sudo apt install ffmpeg)'
 
 async function summarize($: $, answer: string): Promise<string> {
   if (isSpeakable(answer)) return cleanSpoken(answer)
@@ -299,29 +377,59 @@ async function summarize($: $, answer: string): Promise<string> {
 /** Plays while Fish generates. Resolves when the clip ends or something cuts it. */
 async function streamSpeech($: $, key: string, ffmpeg: string, text: string): Promise<void> {
   const tag = `${TAG_PREFIX}${await $.clock.now()}`
-  const bodyPath = `${await tmpDir($)}/${tag}.json`
+  const bodyPath = `${await tmpDir($)}${(await platformOf($)) === 'windows' ? '\\' : '/'}${tag}.json`
   await $.fs.write(bodyPath, ttsBody(text, cfg.voiceId))
-  await $.process.run(['/bin/mkdir', '-p', '-m', '700', await homeData($)])
+  await makeDataDir($)
   st.streamTag = tag
+  const platform = await platformOf($)
+  const batPath = `${await tmpDir($)}\\${tag}.cmd`
   try {
-    const ran = await $.process.run(
-      [
-        '/bin/sh', '-c', STREAM_SCRIPT, 'voice',
-        CURL, ffmpeg, `${FISH}/v1/tts`, cfg.ttsModel, bodyPath, tag,
-        await dataPath($, CURRENT_FILE), PKILL, ANY_SPEECH,
-      ],
-      { stdin: `Authorization: Bearer ${key}\n`, timeoutMs: 180_000 },
-    )
+    let ran
+    if (platform === 'windows') {
+      await $.fs.write(batPath, windowsBatch({ curl: 'curl.exe', ffplay: ffmpeg, url: `${FISH}/v1/tts`, bodyPath, tag, sampleRate: SAMPLE_RATE }))
+      ran = await $.process.run(['cmd.exe', '/d', '/c', batPath], {
+        stdin: stdinHeaders(key, cfg.ttsModel, true),
+        timeoutMs: 180_000,
+      })
+    } else {
+      ran = await $.process.run(
+        [
+          '/bin/sh', '-c', streamScript(platform), 'voice',
+          CURL, ffmpeg, `${FISH}/v1/tts`, cfg.ttsModel, bodyPath, tag,
+          await dataPath($, CURRENT_FILE), PKILL, ANY_SPEECH,
+        ],
+        { stdin: stdinHeaders(key, cfg.ttsModel, false), timeoutMs: 180_000 },
+      )
+    }
     const status = /returned error: (\d+)/.exec(ran.stderr)?.[1]
     if (status !== undefined) $.ui.toast(fishError('text-to-speech', Number(status), ''), { timeoutMs: 8000 })
-    else if (ran.exitCode !== 0 && ran.exitCode !== 137) {
+    else if (platform !== 'windows' && ran.exitCode !== 0 && ran.exitCode !== 137) {
       // 137 is another reply taking over. Anything else is the player failing.
       $.ui.toast(`claudespeak: playback failed: ${ran.stderr.trim().split('\n').pop()?.slice(0, 80) ?? ''}`, { timeoutMs: 8000 })
     }
   } finally {
     if (st.streamTag === tag) st.streamTag = undefined
-    await rm($, bodyPath)
+    await rm($, bodyPath, ...(platform === 'windows' ? [batPath] : []))
   }
+}
+
+/**
+ * Counts the characters about to be spoken against the day's limit. False when the limit
+ * is used up: it says so once, at the reply that crosses it, then stays quiet until tomorrow.
+ */
+async function spendBudget($: $, chars: number, now: number): Promise<boolean> {
+  if (cfg.dailyCharLimit <= 0) return true
+  const day = dayOf(now)
+  const used = usedToday(await $.fs.read(await dataPath($, USAGE_FILE)).catch(() => undefined), day)
+  if (!withinBudget(used, chars, cfg.dailyCharLimit)) {
+    if (used <= cfg.dailyCharLimit) {
+      $.ui.toast(`claudespeak: today's limit of ${cfg.dailyCharLimit} spoken characters is reached. Quiet until tomorrow.`, { timeoutMs: 8000 })
+      await writeData($, USAGE_FILE, usageText(day, cfg.dailyCharLimit + 1))
+    }
+    return false
+  }
+  await writeData($, USAGE_FILE, usageText(day, used + chars))
+  return true
 }
 
 async function speak($: $, answer: string): Promise<void> {
@@ -330,13 +438,15 @@ async function speak($: $, answer: string): Promise<void> {
   const startedAt = await $.clock.now()
   const key = await apiKey($)
   if (key === undefined) return askForKey($)
-  const line = await summarize($, answer)
+  const summary = await summarize($, answer)
+  const line = cfg.redact ? redactPrivate(summary) : summary
   if (line === '' || gen !== st.speechGen) return
+  if (!(await spendBudget($, line.length, startedAt))) return
   const current = await $.fs.read(await dataPath($, CURRENT_FILE)).catch(() => '')
   if (current.startsWith('stopped ') && Number(current.slice(8)) > startedAt) return
-  const ffmpeg = await findFfmpeg($)
+  const ffmpeg = await findPlayer($)
   if (ffmpeg === undefined) {
-    $.ui.toast('ffmpeg not found: brew install ffmpeg', { timeoutMs: 8000 })
+    $.ui.toast(playerHelp(await platformOf($)), { timeoutMs: 8000 })
     return
   }
   await streamSpeech($, key, ffmpeg, line)
@@ -398,8 +508,13 @@ export const register: Register = (on, options) => {
   }).catch(() => ({ text: 'claudespeak: /speak failed.' }))
 
   // A new prompt means the person has moved on: cut the old reply's speech.
-  on('prompt.submit', ($, e, next) => {
+  on('prompt.submit', async ($, e, next) => {
     stopSpeech($)
+    try {
+      st.turnStartedAt = await $.clock.now()
+    } catch {
+      st.turnStartedAt = undefined
+    }
     return next(e)
   }).catch(($, e, next) => next(e))
 
@@ -408,6 +523,15 @@ export const register: Register = (on, options) => {
     const isMainAnswer = e.agentId === undefined && e.reason === 'answer' && e.answer.trim() !== ''
     if (!isMainAnswer) return result
     if (!(await mayTalkHere($)) || !(await isSettingOn($))) return result
+    // Quick replies arrive while the person is still looking: only long turns are worth hearing.
+    let finishedAt: number | undefined
+    try {
+      finishedAt = cfg.minSeconds > 0 ? await $.clock.now() : undefined
+    } catch {
+      finishedAt = undefined
+    }
+    const elapsed = finishedAt !== undefined && st.turnStartedAt !== undefined ? finishedAt - st.turnStartedAt : undefined
+    if (!shouldSpeak(elapsed, cfg.minSeconds)) return result
     void speak($, e.answer).catch(err => {
       $.ui.toast(`claudespeak: ${err instanceof Error ? err.message.slice(0, 100) : 'speech failed'}`)
     })
